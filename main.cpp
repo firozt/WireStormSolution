@@ -40,200 +40,234 @@
 #define DESTINATION_PORT 44444
 
 
-// shared resource between all threads, handled safely with mutex
-std::mutex source_mutex;
-std::mutex destination_mutex;
 
-std::set<int> destination_clients;
-bool source_client_connected = false;
+// Thread safe list of connections
+class ConnectionManager {
+private:
+    std::mutex mutex;
+    std::set<int> clients;
+    int max_connections;
+public:
 
+    ConnectionManager(int max_connections) {
+        this->max_connections = max_connections;
+    };
+
+
+    int get_max_connections() {
+        return max_connections;
+    }
+
+    bool add(int fd) {
+        if (this->size() >= this->max_connections) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(mutex);
+        clients.insert(fd);
+        return true;
+    }
+
+    void remove(int fd) {
+        std::lock_guard<std::mutex> lock(mutex);
+        clients.erase(fd);
+    }
+
+    std::set<int> get_all() {
+        std::lock_guard<std::mutex> lock(mutex);
+        return clients; 
+    }
+
+
+
+    size_t size() {
+        std::lock_guard<std::mutex> lock(mutex);
+        return clients.size();
+    }
+};
+
+// TODO
+class CTMPMessageValidator {
+    public:
+    static bool validate(const char* data, int len);
+};
 
 enum CLIENT_TYPE {
     SOURCE,
     DESTINATION,
 };
 
-
-// handles the source clients actions
-void source_listener(int conn_fd,int MAX) {
-    char buff[MAX]; 
-
-    while(1) { 
-
-        // reset buffer
-        bzero(buff, MAX); 
-        
-        // read the message from client and copy it in buffer 
-        ssize_t msg_bytes = recv(conn_fd, buff, MAX, 0); // blocks execution
-        if (msg_bytes <= 0) {
-            if (msg_bytes == 0) {
-                printf("Source client has disconnected gracefully\n");
-            } else {
-                perror("Source client recv error\n");
-            }
-            break;
+class ServerListener {
+    private:
+    const uint16_t port;
+    const CLIENT_TYPE type;
+    ConnectionManager connections;
+    /**
+    * @brief Creates a socket with the classes set port and a given address.
+    *
+    * Creates a socket with a set port and address using the ipv4 (af_inet) protocol
+    * socket is designed for TCP connections.
+    *
+    * @param address  socket address internet object containing all necessary information.
+    * @param addr_len size of the address object.
+    * @return Returns the socket field descriptor created with the socket sys call if 
+    * successfull, otherwise returns -1, and perrors the error.
+    */
+    int create_socket(sockaddr_in address, int addr_len) {
+        // 1) create socket
+        // socket with ipv4 protocol (af_inet), via tcp (sock_stream)
+        int socket_fd = socket(AF_INET, SOCK_STREAM, 0);
+        // socket_fd should be > 0 to be valid else error
+        if (socket_fd < 0) {
+            perror("Socket creation failed\n");
+            return -1;
         }
-        std::lock_guard<std::mutex> lock(destination_mutex);
-        for (int conn : destination_clients) {
-            // send msg to all destination clients
-            if (send(conn, buff, msg_bytes, 0) < 0) {
-                perror("Unable to send message to desination client");
+
+        // 2) bind socket with address and port
+        int bind_status = bind(socket_fd, (struct sockaddr*) &address, (socklen_t)addr_len);
+
+        if (bind_status < 0) {
+            printf("Unable to bind socket for port %d\n",port);
+            return -1;
+        }
+        // 3) listen to binded socket at client port
+        // takes socket field descriptor and a max len of the queue
+        int listen_status = listen(socket_fd, 10);
+
+        if (listen_status < 0) {
+            perror("Unable to create a listener for socket");
+            return -1;
+        }
+        return socket_fd;
+    }
+
+
+    void source_listener(int conn_fd,int MAX, ConnectionManager* destination_clients) {
+        char buff[MAX]; 
+
+        while(1) { 
+            // reset buffer
+            bzero(buff, MAX); 
+            
+            // read the message from client and copy it in buffer 
+            ssize_t msg_bytes = recv(conn_fd, buff, MAX, 0); // blocks execution
+            if (msg_bytes <= 0) {
+                if (msg_bytes == 0) {
+                    printf("Source client has disconnected gracefully\n");
+                } else {
+                    perror("Source client recv error\n");
+                }
                 break;
-            } 
-        }
-    } 
-} 
-
-
-// handles the destination clients actions
-void destination_listener(int conn_fd, int MAX) {
-    char buff[MAX]; 
-    while (true) {
-        bzero(buff, MAX); 
-        ssize_t bytes_read = recv(conn_fd, buff, MAX, 0); // check if client is still connected
-        if (bytes_read <= 0) {
-            if (bytes_read == 0) {
-                printf("Destination client %d has disconnected gracefully\n", conn_fd);
-            } else {
-                perror("Destination client recv error\n");
             }
-            break;
+            for (int conn : destination_clients->get_all()) {
+                if (send(conn, buff, msg_bytes, 0) < 0) {
+                    perror("Unable to send message to destination client");
+                }
+            }
+        } 
+    } 
+
+    // handles the destination clients actions
+    void destination_listener(int conn_fd, int MAX) {
+        char buff[MAX]; 
+        while (true) {
+            bzero(buff, MAX); 
+            ssize_t bytes_read = recv(conn_fd, buff, MAX, 0); // check if client is still connected
+            if (bytes_read <= 0) {
+                if (bytes_read == 0) {
+                    printf("Destination client %d has disconnected gracefully\n", conn_fd);
+                } else {
+                    perror("Destination client recv error\n");
+                }
+                break;
+            }
         }
     }
-}
 
+    public:
 
-// creates a listening socket
-void create_listening_port(CLIENT_TYPE client) {
-    // 1) create socket
-    // socket with ipv4 protocol (af_inet), via tcp (sock_stream)
-    int socket_fd = socket(AF_INET, SOCK_STREAM, 0);
-    // socket_fd should be > 0 to be valid else error
-    if (socket_fd < 0) {
-        printf("Socket creation failed\n");
-        return;
+    ConnectionManager* get_connections() {
+        return &connections;
     }
 
-    // 2) bind created socket
-    // creating socket addresss struct with valid info
-    uint16_t port = (client == SOURCE) ? SOURCE_PORT : DESTINATION_PORT;
+    ServerListener(uint16_t port, CLIENT_TYPE type, int max_connections)
+        : port(port), type(type), connections(max_connections) {};
 
-    struct sockaddr_in address;
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = INADDR_ANY;
-    address.sin_port = htons(port);
-    int addr_len = sizeof(address);
+        
 
-    // 3) bind socket with address and port
-
-    int bind_status = bind(socket_fd, (struct sockaddr*) &address, (socklen_t)addr_len);
-
-    if (bind_status < 0) {
-        printf("Unable to bind socket for port %d\n",port);
-        return;
-    }
-
-    // 4) listen to binded socket at client port
-
-    // takes socket field descriptor and a max len of the queue
-    int listen_status = listen(socket_fd, 10);
-
-    if (listen_status < 0) {
-        printf("Unable to create a listener for socket");
-        return;
-    }
-
-    printf("Server listening on port %d\n, awaiting connections.", port);
+    // creates a listening socket
+    void run(ConnectionManager* destination_clients=nullptr){
+        // type source must also pass in a list of destination clients to send the messages to
+        if (type == SOURCE && destination_clients == nullptr) {
+            fprintf(stderr, "Error: SOURCE listener requires a destination ConnectionManager.\n");
+            return;
+        }
 
 
-    // 5) accept connection
+        // create address object
+        struct sockaddr_in address;
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = INADDR_ANY;
+        address.sin_port = htons(port);
+        int addr_len = sizeof(address);
 
-    // original thread will wait for connections, once one is requested new thread
-    // is spawned and will handle broadcasted messages from source thread
-    // number of destination clients will be handled by the destination client list
-    if (client == SOURCE) {
+        // create socket and prepares for listening
+        int socket_fd = create_socket(address, addr_len);
+        if (socket_fd < 0) {
+            perror("Could not create socket");
+            return;
+        }
+        
+        printf("Server listening on port %d awaiting connections.\n", port);
+        // accept connection
+        // original thread will wait for connections, once one is requested new thread
+        // is spawned and will handle broadcasted messages from source thread
+        // number of destination clients will be handled by the destination client list
+        
         while(1) {
             int conn_fd = accept(socket_fd, (struct sockaddr*) &address, (socklen_t*)&addr_len); 
             if (conn_fd < 0) { 
-                printf("Failed to accept a source client\n");
+                perror("Failed to accept a source client\n");
                 continue;
             } 
-            {
-                // mutex lock check
-                std::lock_guard<std::mutex> lock(source_mutex);
-                if (source_client_connected) {
-                    const char* err_msg = "Error: Source client already connected.\n";
-                    send(conn_fd, err_msg, strlen(err_msg), 0);
-                    close(conn_fd);
-                    continue;  // reject this connection
-                }
-                source_client_connected = true;
-            }
 
-            std::thread t([conn_fd]() {
-                source_listener(conn_fd, 100);
-                {
-                    std::lock_guard<std::mutex> lock(source_mutex);
-                    source_client_connected = false;
-                }
+            // attempts to add the connection
+            // -1 indicates infinite number of connections
+            if (connections.size() >= connections.get_max_connections() and connections.get_max_connections() != -1) {
+                const char* err_msg = "Error: Source client already connected.\n";
+                send(conn_fd, err_msg, strlen(err_msg), 0);
+                close(conn_fd);
+                continue;  // reject this connection
+            }
+            
+            // accept this connection
+            connections.add(conn_fd);
+            std::thread t([this,conn_fd, destination_clients]() {
+                // use corresponding handler
+                if (type == SOURCE) this->source_listener(conn_fd, 100, destination_clients);
+                if (type == DESTINATION) this->destination_listener(conn_fd, 100);
+                // cleanup socket from connection list
+                connections.remove(conn_fd);
                 close(conn_fd);
             });
             t.detach();
         }
-
+        close(socket_fd);
     }
-    // new thread for the source client, original thread will check if a source is connected
-    // via the source connected flag, to ensure only one source client at a given time
-    if (client == DESTINATION) {   
-        while (true) {
-            int conn_fd = accept(socket_fd, (struct sockaddr*) &address, (socklen_t*)&addr_len);
-            if (conn_fd < 0) {
-                printf("Failed to accept a destination client\n");
-                continue;
-            }
-
-            {
-                // add new client to list safely
-                std::lock_guard<std::mutex> lock(destination_mutex);
-                destination_clients.insert(conn_fd);
-                printf("Number of destination clients: %zu\n", destination_clients.size());
-            }
-
-            std::thread t([conn_fd]() {
-                destination_listener(conn_fd, 100);
-                {
-                    // remove destination client safely (on client termination)
-                    std::lock_guard<std::mutex> lock(destination_mutex);
-                    destination_clients.erase(conn_fd);
-                    printf("Number of destination clients: %zu\n", destination_clients.size());
-                }
-                close(conn_fd);
-            });
-            t.detach();
-        }
-    }
-
-    close(socket_fd);
-    return;
-}
-
-
+};
 
 
 int main() {
-    // create listening ports on two seperare threads
+    // create two listening servers, one for source and destination
+    ServerListener source(SOURCE_PORT,SOURCE, 1);
+    ServerListener destination(DESTINATION_PORT, DESTINATION, -1);
 
-    std::thread source_thread([]() {
-        create_listening_port(SOURCE);
-    });
+    // run the listeners for each on their own thread to handle connections
+    // pass in the connections from the destination to source, so it can send the messages to them
+    std::thread src_thread([&](){ source.run(destination.get_connections()); });
+    std::thread dst_thread([&](){ destination.run(); });
 
-
-    std::thread destination_thread([](){
-        create_listening_port(DESTINATION);
-    });
-
-    source_thread.join();
-    destination_thread.join();
+    src_thread.join();
+    dst_thread.join();
     
     return 1;
 }
