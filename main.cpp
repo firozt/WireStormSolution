@@ -281,16 +281,9 @@ class SourceServer: public BaseServer {
 
             // append newly received bytes to buffer
             message.insert(message.end(), buffer, buffer + bytes_received);
-
             // Process all full messages in buffer
-            while (message.size() >= HEADER_SIZE) {
-                // extract payload length from bytes 2 and 3 and convert to host order
-                int payload_length = CTMPMessageValidator::get_payload_length(message);
-                if (payload_length < 0) {
-                    perror("Source client payload length is invalid");
-                    break;
-                }
-
+            int payload_length = CTMPMessageValidator::get_payload_length(message);
+            while (payload_length >= 0) {
                 size_t full_msg_len = HEADER_SIZE + payload_length;
 
                 if (message.size() < full_msg_len) {
@@ -300,9 +293,9 @@ class SourceServer: public BaseServer {
 
                 // Validate the full message
                 if (!CTMPMessageValidator::validate(message)) {
-                    // Invalid message, drop these bytes (or handle differently)
+                    // Invalid message, drop these bytes
                     message.erase(message.begin(), message.begin() + full_msg_len);
-                    continue;
+                    break;
                 }
 
                 // send the valid ctmp message to all destination clients
