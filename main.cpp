@@ -81,13 +81,15 @@ class CTMPMessageValidator {
         // not enough bytes for a CTMP message
         if (data.size() < HEADER_SIZE) return false;
 
-        // checking magic and padding byte
+        // checking magic byte
         if (data[0] != magic_byte) return false;
-        if (data[1] != padding_byte) return false;
+
+        int options = get_options(data);
+        if (nth_bit_set(options,1) && !check_checksum(data)) return false; // invalid checksum on secure message
+
 
         // checking payload length
         int payload_length = get_payload_length(data);
-        if (payload_length < 0) return false;
 
 
         // checks next 4 padding bytes
@@ -103,15 +105,80 @@ class CTMPMessageValidator {
         return true;
     }
 
+    static bool check_checksum(const std::vector<uint8_t>& data) {
+        if (data.size() < HEADER_SIZE) return false;
+        std::vector<uint8_t> message = data; // copy data
+        size_t checksum_offset = 4;
+
+        // 1. set the checksum field to 0xCCCC
+        message[checksum_offset] = 0xCC;
+        message[checksum_offset + 1] = 0xCC;
+
+        uint32_t sum = 0;
+
+        // 2. Process all 16-bit words
+        for (size_t i = 0; i + 1 < message.size(); i += 2) {
+            uint16_t word = (message[i] << 8) | message[i + 1];
+            sum += word;
+
+            // Wrap around carry bits beyond 16 bits
+            if (sum > 0xFFFF) {
+                sum = (sum & 0xFFFF) + 1;
+            }
+        }
+
+        // 3. If odd number of bytes, pad the last byte with 0
+        if (message.size() % 2 != 0) {
+            uint16_t word = message.back() << 8;
+            sum += word;
+            if (sum > 0xFFFF) {
+                sum = (sum & 0xFFFF) + 1;
+            }
+        }
+
+        // 4. One's complement of the sum
+        return (uint16_t)(~sum) == 0x0000;
+    }
+
+
+    // returns -1 if data is not large enough to contain the header
+    // otherwise an uint16_t representing the checksum value in host order
+    static int get_checksum(const std::vector<uint8_t>& data) {
+        if (data.size() < HEADER_SIZE) return 0;
+
+        uint16_t checksum;
+        std::memcpy(&checksum, &data[4], sizeof(uint16_t));
+        return ntohs(checksum);
+    }
+
+
+    // returns -1 if data is not large enough to contain the header
+    // otherwise an uint8_t that represents the payload length field in host order
     static int get_payload_length(const std::vector<uint8_t>& data) {
         if (data.size() < HEADER_SIZE) return -1;
-        // extract payload length from ctmp message
-        // copy the next 2 bytes, convert it from network order.
+
         uint16_t payload_length_network_order;
         std::memcpy(&payload_length_network_order, &data[2], sizeof(uint16_t));
         return ntohs(payload_length_network_order);
     }
+
+    // returns -1 if data is not large enough to contain the header
+    // otherwise an uint8_t that represents the options field
+    static int get_options(const std::vector<uint8_t>& data) {
+        if (data.size() < HEADER_SIZE) return -1;
+        uint8_t options;
+        std::memcpy(&options, &data[1], sizeof(uint8_t));
+        return options;
+    }
+
+    private:
+    // reads from left to right
+    static bool nth_bit_set(uint8_t byte, int n) {
+        if (n < 0 || n > 7) return false; // out of bounds
+        return (byte & (1 << (7 - n))) != 0;
+    }
 };
+
 
 
 /**
@@ -282,14 +349,9 @@ class SourceServer: public BaseServer {
             // append newly received bytes to buffer
             message.insert(message.end(), buffer, buffer + bytes_received);
 
-            // Process all full messages in buffer
-            while (message.size() >= HEADER_SIZE) {
-                // extract payload length from bytes 2 and 3 and convert to host order
-                int payload_length = CTMPMessageValidator::get_payload_length(message);
-                if (payload_length < 0) {
-                    perror("Source client payload length is invalid");
-                    break;
-                }
+            int payload_length = CTMPMessageValidator::get_payload_length(message);
+            // attempt to process the current messages in buffer
+            while (payload_length >= 0) {
 
                 size_t full_msg_len = HEADER_SIZE + payload_length;
 
@@ -300,9 +362,9 @@ class SourceServer: public BaseServer {
 
                 // Validate the full message
                 if (!CTMPMessageValidator::validate(message)) {
-                    // Invalid message, drop these bytes (or handle differently)
+                    // Invalid message, drop these bytes
                     message.erase(message.begin(), message.begin() + full_msg_len);
-                    continue;
+                    break;
                 }
 
                 // send the valid ctmp message to all destination clients
