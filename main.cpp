@@ -281,9 +281,12 @@ class SourceServer: public BaseServer {
 
             // append newly received bytes to buffer
             message.insert(message.end(), buffer, buffer + bytes_received);
-            // Process all full messages in buffer
-            int payload_length = CTMPMessageValidator::get_payload_length(message);
-            while (payload_length >= 0) {
+            // attempt to process the current message in buffer
+
+            // returns -1 if size of message cannot contain the header
+            while (message.size() >= HEADER_SIZE) {
+
+                uint8_t payload_length = CTMPMessageValidator::get_payload_length(message);
                 size_t full_msg_len = HEADER_SIZE + payload_length;
 
                 if (message.size() < full_msg_len) {
