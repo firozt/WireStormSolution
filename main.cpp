@@ -1,5 +1,4 @@
 #include <sys/socket.h>
-#include <sys/types.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
@@ -17,6 +16,7 @@
 /**
  * @class ConnectionManager
  * @brief Thread safe way of managing list of connected clients
+ * controls max number of clients
  */
 class ConnectionManager {
 private:
@@ -58,7 +58,7 @@ public:
 };
 
 /**
- * @class CTMPMessageValidator
+ * @class CTMPMessageValidator (abstract)
  * @brief Validates and parses custom binary message packets.
  */
 class CTMPMessageValidator {
@@ -113,21 +113,16 @@ class CTMPMessageValidator {
     }
 };
 
-// types of clients for the server listener class
-enum CLIENT_TYPE {
-    SOURCE,
-    DESTINATION,
-};
 
 /**
- * @class ServerListener
- * @brief Creates a server that listens to a given port, type specifies
- * actions of connected clients
+ * @class BaseServer
+ * @brief Basic functionalities of a TCP IPv4 server, listens to a port, manages connections
+ * actions of connected clients is handled by the virtual method handleClient, that must be
+ * overwritten in child classes
  */
-class ServerListener {
+class BaseServer {
     private:
     const uint16_t port;
-    const CLIENT_TYPE type;
     ConnectionManager connections;
 
 
@@ -160,8 +155,115 @@ class ServerListener {
         return socket_fd;
     }
 
+    // all child classes must override this
+    virtual void handleClient(int conn_fd) = 0;
 
-    static void source_listener(int conn_fd, ConnectionManager* destination_clients) {
+    public:
+
+    BaseServer(uint16_t port, int max_connections)
+    : port(port), connections(max_connections) {};
+
+    ConnectionManager* get_connections() {
+        return &connections;
+    }
+
+    void run(ConnectionManager* destination_clients=nullptr){
+        // creates a listening socket
+
+        // create address object
+        struct sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = INADDR_ANY;
+        address.sin_port = htons(port);
+        int addr_len = sizeof(address);
+
+        // create socket and prepares for listening
+        int socket_fd = create_socket(address, addr_len);
+        if (socket_fd < 0) {
+            perror("Could not create socket");
+            return;
+        }
+        
+        printf("Server listening on port %d awaiting connections.\n", port);
+        // accept connection
+        // original thread will wait for connections, once one is requested new thread
+        // is spawned and will handle broadcasted messages from source thread
+        // number of destination clients will be handled by the destination client list
+        
+        while(true) {
+            int conn_fd = accept(socket_fd, (struct sockaddr*) &address, (socklen_t*)&addr_len);
+            if (conn_fd < 0) { 
+                perror("Failed to accept a source client\n");
+                continue;
+            } 
+
+            // attempts to add the connection
+            // -1 indicates infinite number of connections
+            if (connections.size() >= connections.get_max_connections() and connections.get_max_connections() != -1) {
+                const char* err_msg = "Error: Source client already connected.\n";
+                send(conn_fd, err_msg, strlen(err_msg), 0);
+                close(conn_fd);
+                continue;  // reject this connection
+            }
+            
+            // accept this connection
+            connections.add(conn_fd);
+            std::thread t([this,conn_fd, destination_clients]() {
+                // use corresponding handler
+                    this->handleClient(conn_fd);
+                // cleanup socket from connection list
+                connections.remove(conn_fd);
+                close(conn_fd);
+            });
+            t.detach();
+        }
+        close(socket_fd);
+    }
+};
+
+/**
+ * @class DestinationServer
+ * @brief Takes in any number of connections, waits for TCMP to
+ * be sent from another server
+ */
+class DestinationServer: public BaseServer {
+    public:
+    DestinationServer()
+    : BaseServer(DESTINATION_PORT, -1) {} // -1 means unlimited connections
+
+    private:
+    // handles the destination clients actions
+    void handleClient(int conn_fd) {
+        char buff[MAX_BUFFER_SIZE];
+        while (true) {
+            bzero(buff, MAX_BUFFER_SIZE);
+            ssize_t bytes_read = recv(conn_fd, buff, MAX_BUFFER_SIZE, 0); // check if client is still connected
+            if (bytes_read <= 0) {
+                if (bytes_read == 0) {
+                    printf("Destination client %d has disconnected gracefully\n", conn_fd);
+                } else {
+                    perror("Destination client recv error\n");
+                }
+                break;
+            }
+        }
+    }
+};
+
+/**
+ * @class SourceServer
+ * @brief Takes in at most one client at a time (enforced via constructor),
+ * broadcasts validated CTMP messages to a list of connected
+ * destination clients (passed in through the constructor)
+ */
+class SourceServer: public BaseServer {
+    public:
+    SourceServer(ConnectionManager* dest_clients)
+    : BaseServer(SOURCE_PORT, 1), destination_clients(dest_clients) {}
+
+    private:
+    ConnectionManager* destination_clients;
+    void handleClient(int conn_fd) override {
         std::vector<uint8_t> message;
         message.reserve(MAX_BUFFER_SIZE);
         uint8_t buffer[MAX_BUFFER_SIZE/2];
@@ -215,110 +317,24 @@ class ServerListener {
             }
         }
     }
-
-    // handles the destination clients actions
-    static void destination_listener(int conn_fd) {
-        char buff[MAX_BUFFER_SIZE];
-        while (true) {
-            bzero(buff, MAX_BUFFER_SIZE);
-            ssize_t bytes_read = recv(conn_fd, buff, MAX_BUFFER_SIZE, 0); // check if client is still connected
-            if (bytes_read <= 0) {
-                if (bytes_read == 0) {
-                    printf("Destination client %d has disconnected gracefully\n", conn_fd);
-                } else {
-                    perror("Destination client recv error\n");
-                }
-                break;
-            }
-        }
-    }
-
-    public:
-
-    ConnectionManager* get_connections() {
-        return &connections;
-    }
-
-    ServerListener(uint16_t port, CLIENT_TYPE type, int max_connections)
-        : port(port), type(type), connections(max_connections) {};
-
-        
-
-    // creates a listening socket
-    void run(ConnectionManager* destination_clients=nullptr){
-        // type source must also pass in a list of destination clients to send the messages to
-        if (type == SOURCE && destination_clients == nullptr) {
-            fprintf(stderr, "Error: SOURCE listener requires a destination ConnectionManager.\n");
-            return;
-        }
-
-
-        // create address object
-        struct sockaddr_in address{};
-        address.sin_family = AF_INET;
-        address.sin_addr.s_addr = INADDR_ANY;
-        address.sin_port = htons(port);
-        int addr_len = sizeof(address);
-
-        // create socket and prepares for listening
-        int socket_fd = create_socket(address, addr_len);
-        if (socket_fd < 0) {
-            perror("Could not create socket");
-            return;
-        }
-        
-        printf("Server listening on port %d awaiting connections.\n", port);
-        // accept connection
-        // original thread will wait for connections, once one is requested new thread
-        // is spawned and will handle broadcasted messages from source thread
-        // number of destination clients will be handled by the destination client list
-        
-        while(true) {
-            int conn_fd = accept(socket_fd, (struct sockaddr*) &address, (socklen_t*)&addr_len);
-            if (conn_fd < 0) { 
-                perror("Failed to accept a source client\n");
-                continue;
-            } 
-
-            // attempts to add the connection
-            // -1 indicates infinite number of connections
-            if (connections.size() >= connections.get_max_connections() and connections.get_max_connections() != -1) {
-                const char* err_msg = "Error: Source client already connected.\n";
-                send(conn_fd, err_msg, strlen(err_msg), 0);
-                close(conn_fd);
-                continue;  // reject this connection
-            }
-            
-            // accept this connection
-            connections.add(conn_fd);
-            std::thread t([this,conn_fd, destination_clients]() {
-                // use corresponding handler
-                if (type == SOURCE) this->source_listener(conn_fd, destination_clients);
-                if (type == DESTINATION) this->destination_listener(conn_fd);
-                // cleanup socket from connection list
-                connections.remove(conn_fd);
-                close(conn_fd);
-            });
-            t.detach();
-        }
-        close(socket_fd);
-    }
 };
 
 
 int main() {
-    // create two listening servers, one for source and destination
-    // source has max connections of 1, destination has unbound (-1)
-    ServerListener source(SOURCE_PORT,SOURCE, 1);
-    ServerListener destination(DESTINATION_PORT, DESTINATION, -1);
+    // create destination server (allows unlimited connections)
+    DestinationServer destination_server;
 
-    // run the listeners for each on their own thread to handle connections
-    // pass in the connections from the destination to source, so it can send the messages to them
-    std::thread src_thread([&](){ source.run(destination.get_connections()); });
-    std::thread dst_thread([&](){ destination.run(); });
+    // create source server (only 1 connection allowed, forwards to destinations)
+    // pass in destination server connections to source server, used for sending messages
+    // to all clients of destination server
+    SourceServer source_server(destination_server.get_connections());
 
-    src_thread.join();
+    // start both servers on their own threads
+    std::thread dst_thread([&]() { destination_server.run(); });
+    std::thread src_thread([&]() { source_server.run(); });
+
     dst_thread.join();
-    
-    return 1;
+    src_thread.join();
+
+    return 0;
 }
