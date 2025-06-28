@@ -11,7 +11,9 @@
 #define DESTINATION_PORT 44444
 #define MAX_BUFFER_SIZE 2048 // bytes
 #define HEADER_SIZE 8 // bytes
-
+#define CHECKSUM_OFFSET 4
+#define OPTIONS_OFFSET 1
+#define LENGTH_OFFSET 2
 
 /**
  * @class ConnectionManager
@@ -49,8 +51,6 @@ public:
         return clients; 
     }
 
-
-
     size_t size() {
         std::lock_guard<std::mutex> lock(mutex);
         return clients.size();
@@ -81,6 +81,7 @@ class CTMPMessageValidator {
         int options = get_options(data);
         if (nth_bit_set(options,1) && !validate_checksum(data, get_checksum(data))) {
             // invalid checksum on secure message
+            printf("Invalid checksum on secure CTMP message, dropping message.\n");
             return false;
         }
         size_t payload_length = get_payload_length(data);
@@ -106,32 +107,37 @@ class CTMPMessageValidator {
         }
 
         // make a copy of the message and replace checksum bytes with 0xCC
-        std::vector<uint8_t> temp = message;
-        temp[4] = 0xCC;
-        temp[5] = 0xCC;
 
         uint32_t sum = 0;
 
         // sum all 16-bit words in message (including header)
         size_t i = 0;
-        for (; i + 1 < temp.size(); i += 2) {
-            // concats temp[i] with tem[i+1] via bit manipulation
-            // converts temp[i] to 16 bits, padding left bits with 0's
-            // bit shift temp[i] to the left by 8 so all the 0's are now on the right
-            // logical OR temp[i] and temp[i+1]
-            uint16_t word = ((uint16_t)(temp[i]) << 8) | temp[i + 1];
+        for (; i + 1 < message.size(); i += 2) {
+            uint16_t word;
+            if (i == CHECKSUM_OFFSET) {
+                // skip checksum field
+                word = 0xCCCC;
+            } else {
+                // concats byte1 with tem[i+1] via bit manipulation
+                // converts byte1 to 16 bits, padding left bits with 0's
+                // bit shift byte1 to the left by 8 so all the 0's are now on the right
+                // logical OR byte1 and byte2
+                uint8_t byte1 = message[i];
+                uint8_t byte2 = message[i + 1];
+                word = (static_cast<uint16_t>(message[i]) << 8) | message[i + 1];
+            }
             sum += word;
         }
 
         // edge case that the message is odd number of bytes
         // add padding
-        if (i < temp.size()) {
+        if (i < message.size()) {
             // pads the 8 rightmost bits with 0 by converting and bit shifts
-            uint16_t last = (uint16_t)(temp[i]) << 8;
+            uint16_t last = static_cast<uint16_t>(message[i]) << 8;
             sum += last;
         }
 
-        // Fold carry bits from top 16 bits into lower 16 bits
+        // fold carry bits from top 16 bits into lower 16 bits
         while (sum >> 16) {
             sum = (sum & 0xFFFF) + (sum >> 16);
         }
@@ -143,15 +149,13 @@ class CTMPMessageValidator {
         return calculated_checksum == checksum;
     }
 
-
-
     // returns -1 if data is not large enough to contain the header
     // otherwise an uint16_t representing the checksum value in host order
     static int get_checksum(const std::vector<uint8_t>& data) {
         if (data.size() < HEADER_SIZE) return 0;
 
         uint16_t checksum;
-        std::memcpy(&checksum, &data[4], sizeof(uint16_t));
+        std::memcpy(&checksum, &data[CHECKSUM_OFFSET], sizeof(uint16_t));
         return ntohs(checksum);
     }
 
@@ -162,7 +166,7 @@ class CTMPMessageValidator {
         if (data.size() < HEADER_SIZE) return -1;
 
         uint16_t payload_length_network_order;
-        std::memcpy(&payload_length_network_order, &data[2], sizeof(uint16_t));
+        std::memcpy(&payload_length_network_order, &data[LENGTH_OFFSET], sizeof(uint16_t));
         return ntohs(payload_length_network_order);
     }
 
@@ -171,7 +175,7 @@ class CTMPMessageValidator {
     static int get_options(const std::vector<uint8_t>& data) {
         if (data.size() < HEADER_SIZE) return -1;
         uint8_t options;
-        std::memcpy(&options, &data[1], sizeof(uint8_t));
+        std::memcpy(&options, &data[OPTIONS_OFFSET], sizeof(uint8_t));
         return options;
     }
 
@@ -183,9 +187,9 @@ class CTMPMessageValidator {
     }
 };
 
-
 /**
- * @class BaseServer (abstract)
+ * Abstract
+ * @class BaseServer
  * @brief Basic functionalities of a TCP IPv4 server, listens to a port, manages connections
  * actions of connected clients is handled by the virtual method handleClient, that must be
  * overwritten in child classes
@@ -196,7 +200,8 @@ class BaseServer {
     ConnectionManager connections;
 
 
-    // creates a IPv4 TCP socket listening to a given port passed in through address
+    // creates a IPv4 TCP socket, binds it with the address config and listens to it
+    // returns the socket_fd
     int create_socket(sockaddr_in& address, int addr_len) const {
         //  create socket
         // ipv4 protocol (af_inet), via tcp (sock_stream)
@@ -208,13 +213,13 @@ class BaseServer {
         }
 
         //  bind socket with address and port
-        int bind_status = bind(socket_fd, (struct sockaddr*) &address, (socklen_t)addr_len);
+        int bind_status = bind(socket_fd, reinterpret_cast<struct sockaddr *>(&address), static_cast<socklen_t>(addr_len));
 
         if (bind_status < 0) {
             printf("Unable to bind socket for port %d\n",port);
             return -1;
         }
-        //  listen to tne binded socket at client port
+        //  listen to the binded socket at client port
         // takes socket field descriptor and a max len of the queue
         int listen_status = listen(socket_fd, 10);
 
@@ -233,6 +238,8 @@ class BaseServer {
     BaseServer(uint16_t port, int max_connections)
     : port(port), connections(max_connections) {};
 
+
+    // returns a pointer to the current objects connection mannager object
     ConnectionManager* get_connections() {
         return &connections;
     }
@@ -270,10 +277,11 @@ class BaseServer {
             // attempts to add the connection
             // -1 indicates infinite number of connections
             if (connections.size() >= connections.get_max_connections() and connections.get_max_connections() != -1) {
+                // reject this connection, send attempted client an error
                 const char* err_msg = "Error: Source client already connected.\n";
                 send(conn_fd, err_msg, strlen(err_msg), 0);
                 close(conn_fd);
-                continue;  // reject this connection
+                continue;
             }
             
             // accept this connection
@@ -289,6 +297,7 @@ class BaseServer {
         }
         close(socket_fd);
     }
+
 };
 
 /**
@@ -303,7 +312,7 @@ class DestinationServer: public BaseServer {
 
     private:
     // handles the destination clients actions
-    void handleClient(int conn_fd) {
+    void handleClient(const int conn_fd) override {
         char buff[MAX_BUFFER_SIZE];
         while (true) {
             bzero(buff, MAX_BUFFER_SIZE);
@@ -333,7 +342,7 @@ class SourceServer: public BaseServer {
 
     private:
     ConnectionManager* destination_clients;
-    void handleClient(int conn_fd) override {
+    void handleClient(const int conn_fd) override {
         std::vector<uint8_t> message;
         message.reserve(MAX_BUFFER_SIZE);
         uint8_t buffer[MAX_BUFFER_SIZE/2];
@@ -352,14 +361,15 @@ class SourceServer: public BaseServer {
             // append newly received bytes to buffer
             message.insert(message.end(), buffer, buffer + bytes_received);
 
-            int payload_length = CTMPMessageValidator::get_payload_length(message);
             // attempt to process the current messages in buffer
-            while (payload_length >= 0) {
+            while (message.size() >= HEADER_SIZE) {
+                int payload_length = CTMPMessageValidator::get_payload_length(message);
 
+                // header size + length field in header
                 size_t full_msg_len = HEADER_SIZE + payload_length;
 
                 if (message.size() < full_msg_len) {
-                    // Not enough data yet for full message
+                    // not enough data yet for full message
                     break;
                 }
 
@@ -370,20 +380,27 @@ class SourceServer: public BaseServer {
                     break;
                 }
 
-                // send the valid ctmp message to all destination clients
-                for (int conn : destination_clients->get_all()) {
-                    if (send(conn, message.data(), full_msg_len, 0) < 0) {
-                        perror("Unable to send message to destination client");
-                    }
-                }
+                // passed all validation, send to all destination clients
+                send_message_all(message);
 
                 // remove the processed message from buffer
                 message.erase(message.begin(), message.begin() + full_msg_len);
             }
         }
     }
-};
+    private:
 
+    // sends a message passed in to all destination clients
+    void send_message_all(const std::vector<uint8_t>& message) {
+        // send the valid ctmp message to all destination clients
+        for (int conn : destination_clients->get_all()) {
+            if (send(conn, message.data(), message.size(), 0) < 0) {
+                perror("Unable to send message to destination client");
+            }
+        }
+    }
+
+};
 
 int main() {
     // create destination server (allows unlimited connections)
