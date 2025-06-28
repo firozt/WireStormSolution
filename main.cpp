@@ -58,21 +58,15 @@ public:
 };
 
 /**
- * @class CTMPMessageValidator (abstract)
- * @brief Validates and parses custom binary message packets.
+ * @class CTMPMessageValidator
+ * @brief Validates and parses data against the CTMP protocol standards
+ * describe in the challenge briefing
  */
 class CTMPMessageValidator {
     public:
-    /**
-    * @brief Validates a CTMP message against the CTMP protocol standards
-    *
-    * Checks for all header properties, and validates them, including: magic byte,
-    * padding bytes, length bytes. This method also checks that the payload data's
-    * length corresponds to the headers payload length property
-    *
-    * @param data  the data contained within a vector of uint8_t
-    * @return boolean, true if data is a valid CTMP message else false
-    */
+    // Checks for all header properties, and validates them, including: magic byte,
+    // padding bytes, length bytes.
+    // returns true if data passes all checks, else false
     static bool validate(const std::vector<uint8_t>& data) {
         constexpr uint8_t magic_byte = 0xCC;
         constexpr uint8_t padding_byte = 0x00;
@@ -81,41 +75,39 @@ class CTMPMessageValidator {
         // not enough bytes for a CTMP message
         if (data.size() < HEADER_SIZE) return false;
 
-        // checking magic and padding byte
+        // checking magic byte and padding byte
         if (data[0] != magic_byte) return false;
         if (data[1] != padding_byte) return false;
 
-        // checking payload length
-        int payload_length = get_payload_length(data);
-        if (payload_length < 0) return false;
+        size_t payload_length = get_payload_length(data);
 
-
-        // checks next 4 padding bytes
+        // checks the last 4 bytes of header is padding
         for (size_t i = 4; i < HEADER_SIZE; ++i) {
             if (data[i] != padding_byte) return false;
         }
 
-
         // if the data in payload exceeds payload size drop message
         size_t actual_payload_size = data.size() - HEADER_SIZE;
-        if (actual_payload_size > static_cast<size_t>(payload_length)) return false;
+        if (actual_payload_size > (payload_length)) return false;
 
         return true;
     }
 
+    // returns -1 if data is not large enough to contain the header
+    // otherwise an uint8_t that represents the payload length field in host order
     static int get_payload_length(const std::vector<uint8_t>& data) {
         if (data.size() < HEADER_SIZE) return -1;
-        // extract payload length from ctmp message
-        // copy the next 2 bytes, convert it from network order.
+
         uint16_t payload_length_network_order;
         std::memcpy(&payload_length_network_order, &data[2], sizeof(uint16_t));
         return ntohs(payload_length_network_order);
     }
+
 };
 
 
 /**
- * @class BaseServer
+ * @class BaseServer (abstract)
  * @brief Basic functionalities of a TCP IPv4 server, listens to a port, manages connections
  * actions of connected clients is handled by the virtual method handleClient, that must be
  * overwritten in child classes
@@ -127,7 +119,7 @@ class BaseServer {
 
 
     // creates a IPv4 TCP socket listening to a given port passed in through address
-    int create_socket(sockaddr_in address, int addr_len) const {
+    int create_socket(sockaddr_in& address, int addr_len) const {
         //  create socket
         // ipv4 protocol (af_inet), via tcp (sock_stream)
         int socket_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -183,19 +175,19 @@ class BaseServer {
             perror("Could not create socket");
             return;
         }
-        
+
         printf("Server listening on port %d awaiting connections.\n", port);
         // accept connection
         // original thread will wait for connections, once one is requested new thread
         // is spawned and will handle broadcasted messages from source thread
         // number of destination clients will be handled by the destination client list
-        
+
         while(true) {
             int conn_fd = accept(socket_fd, (struct sockaddr*) &address, (socklen_t*)&addr_len);
-            if (conn_fd < 0) { 
+            if (conn_fd < 0) {
                 perror("Failed to accept a source client\n");
                 continue;
-            } 
+            }
 
             // attempts to add the connection
             // -1 indicates infinite number of connections
@@ -205,7 +197,7 @@ class BaseServer {
                 close(conn_fd);
                 continue;  // reject this connection
             }
-            
+
             // accept this connection
             connections.add(conn_fd);
             std::thread t([this,conn_fd]() {
@@ -223,8 +215,8 @@ class BaseServer {
 
 /**
  * @class DestinationServer
- * @brief Takes in any number of connections, waits for TCMP to
- * be sent from another server
+ * @brief Implementation of the destination server, takes in any number of connections,
+ * waits for CTMP to be sent from another server
  */
 class DestinationServer: public BaseServer {
     public:
@@ -252,8 +244,8 @@ class DestinationServer: public BaseServer {
 
 /**
  * @class SourceServer
- * @brief Takes in at most one client at a time (enforced via constructor),
- * broadcasts validated CTMP messages to a list of connected
+ * @brief Implementation of the source server, takes in at most one client at a time
+ * (enforced via constructor), broadcasts validated CTMP messages to a list of connected
  * destination clients (passed in through the constructor)
  */
 class SourceServer: public BaseServer {
@@ -281,12 +273,11 @@ class SourceServer: public BaseServer {
 
             // append newly received bytes to buffer
             message.insert(message.end(), buffer, buffer + bytes_received);
-            // attempt to process the current message in buffer
 
-            // returns -1 if size of message cannot contain the header
-            while (message.size() >= HEADER_SIZE) {
+            int payload_length = CTMPMessageValidator::get_payload_length(message);
+            // attempt to process the current messages in buffer
+            while (payload_length >= 0) {
 
-                uint8_t payload_length = CTMPMessageValidator::get_payload_length(message);
                 size_t full_msg_len = HEADER_SIZE + payload_length;
 
                 if (message.size() < full_msg_len) {
@@ -298,8 +289,10 @@ class SourceServer: public BaseServer {
                 if (!CTMPMessageValidator::validate(message)) {
                     // Invalid message, drop these bytes
                     message.erase(message.begin(), message.begin() + full_msg_len);
+                    printf("Dropping message\n");
                     break;
                 }
+                printf("Broadcasting message\n");
 
                 // send the valid ctmp message to all destination clients
                 for (int conn : destination_clients->get_all()) {
@@ -321,7 +314,7 @@ int main() {
     DestinationServer destination_server;
 
     // create source server (only 1 connection allowed, forwards to destinations)
-    // pass in destination server connections to source server, used for sending messages
+    // pass in a pointer to destination server connections to source server, used for sending messages
     // to all clients of destination server
     SourceServer source_server(destination_server.get_connections());
 
