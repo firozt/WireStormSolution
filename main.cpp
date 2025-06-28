@@ -167,7 +167,7 @@ class BaseServer {
         return &connections;
     }
 
-    void run(ConnectionManager* destination_clients=nullptr){
+    void run(){
         // creates a listening socket
 
         // create address object
@@ -208,7 +208,7 @@ class BaseServer {
             
             // accept this connection
             connections.add(conn_fd);
-            std::thread t([this,conn_fd, destination_clients]() {
+            std::thread t([this,conn_fd]() {
                 // use corresponding handler
                     this->handleClient(conn_fd);
                 // cleanup socket from connection list
