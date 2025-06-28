@@ -58,21 +58,15 @@ public:
 };
 
 /**
- * @class CTMPMessageValidator (abstract)
- * @brief Validates and parses custom binary message packets.
+ * @class CTMPMessageValidator
+ * @brief Validates and parses data against the CTMP protocol standards
+ * describe in the challenge briefing
  */
 class CTMPMessageValidator {
     public:
-    /**
-    * @brief Validates a CTMP message against the CTMP protocol standards
-    *
-    * Checks for all header properties, and validates them, including: magic byte,
-    * padding bytes, length bytes. This method also checks that the payload data's
-    * length corresponds to the headers payload length property
-    *
-    * @param data  the data contained within a vector of uint8_t
-    * @return boolean, true if data is a valid CTMP message else false
-    */
+    // Checks for all header properties, and validates them, including: magic byte,
+    // padding bytes, length bytes, options and checksum if secure.
+    // returns true if data passes all checks, else false
     static bool validate(const std::vector<uint8_t>& data) {
         constexpr uint8_t magic_byte = 0xCC;
         constexpr uint8_t padding_byte = 0x00;
@@ -85,60 +79,71 @@ class CTMPMessageValidator {
         if (data[0] != magic_byte) return false;
 
         int options = get_options(data);
-        if (nth_bit_set(options,1) && !check_checksum(data)) return false; // invalid checksum on secure message
+        if (nth_bit_set(options,1) && !validate_checksum(data, get_checksum(data))) {
+            // invalid checksum on secure message
+            printf("Invalid checksum on secure message\n");
+            return false;
+        }
+        size_t payload_length = get_payload_length(data);
 
-
-        // checking payload length
-        int payload_length = get_payload_length(data);
-
-
-        // checks next 4 padding bytes
-        for (size_t i = 4; i < HEADER_SIZE; ++i) {
+        // checks the last 2 bytes of header is padding
+        for (size_t i = 6; i < HEADER_SIZE; ++i) {
             if (data[i] != padding_byte) return false;
         }
 
 
         // if the data in payload exceeds payload size drop message
         size_t actual_payload_size = data.size() - HEADER_SIZE;
-        if (actual_payload_size > static_cast<size_t>(payload_length)) return false;
+        if (actual_payload_size > (payload_length)) return false;
 
         return true;
     }
 
-    static bool check_checksum(const std::vector<uint8_t>& data) {
-        if (data.size() < HEADER_SIZE) return false;
-        std::vector<uint8_t> message = data; // copy data
-        size_t checksum_offset = 4;
+    // validates checksum of a CTMP message (including header)
+    // returns true if valid, false if invalid
+    static bool validate_checksum(const std::vector<uint8_t>& message, const uint16_t checksum) {
+        if (message.size() < HEADER_SIZE) {
+            return false;  // header too short
+        }
 
-        // 1. set the checksum field to 0xCCCC
-        message[checksum_offset] = 0xCC;
-        message[checksum_offset + 1] = 0xCC;
+        // make a copy of the message and replace checksum bytes with 0xCC
+        std::vector<uint8_t> temp = message;
+        temp[4] = 0xCC;
+        temp[5] = 0xCC;
 
         uint32_t sum = 0;
 
-        // 2. Process all 16-bit words
-        for (size_t i = 0; i + 1 < message.size(); i += 2) {
-            uint16_t word = (message[i] << 8) | message[i + 1];
+        // sum all 16-bit words in message (including header)
+        size_t i = 0;
+        for (; i + 1 < temp.size(); i += 2) {
+            // concats temp[i] with tem[i+1] via bit manipulation
+            // converts temp[i] to 16 bits, padding left bits with 0's
+            // bit shift temp[i] to the left by 8 so all the 0's are now on the right
+            // logical OR temp[i] and temp[i+1]
+            uint16_t word = ((uint16_t)(temp[i]) << 8) | temp[i + 1];
             sum += word;
-
-            // Wrap around carry bits beyond 16 bits
-            if (sum > 0xFFFF) {
-                sum = (sum & 0xFFFF) + 1;
-            }
         }
 
-        // 3. If odd number of bytes, pad the last byte with 0
-        if (message.size() % 2 != 0) {
-            uint16_t word = message.back() << 8;
-            sum += word;
-            if (sum > 0xFFFF) {
-                sum = (sum & 0xFFFF) + 1;
-            }
+        // edge case that the message is odd number of bytes
+        // add padding
+        if (i < temp.size()) {
+            // pads the 8 rightmost bits with 0 by converting and bit shifts
+            uint16_t last = (uint16_t)(temp[i]) << 8;
+            sum += last;
         }
 
-        // 4. One's complement of the sum
-        return (uint16_t)(~sum) == 0x0000;
+        // Fold carry bits from top 16 bits into lower 16 bits
+        while (sum >> 16) {
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        }
+
+
+        // calculate ones complement of sum <=> negation of bits of sum
+        uint16_t calculated_checksum = ~sum;
+
+        return calculated_checksum == checksum;
     }
+
 
 
     // returns -1 if data is not large enough to contain the header
@@ -172,7 +177,7 @@ class CTMPMessageValidator {
     }
 
     private:
-    // reads from left to right
+    // checks if nth bit from the left is set in a byte
     static bool nth_bit_set(uint8_t byte, int n) {
         if (n < 0 || n > 7) return false; // out of bounds
         return (byte & (1 << (7 - n))) != 0;
@@ -180,9 +185,8 @@ class CTMPMessageValidator {
 };
 
 
-
 /**
- * @class BaseServer
+ * @class BaseServer (abstract)
  * @brief Basic functionalities of a TCP IPv4 server, listens to a port, manages connections
  * actions of connected clients is handled by the virtual method handleClient, that must be
  * overwritten in child classes
@@ -194,7 +198,7 @@ class BaseServer {
 
 
     // creates a IPv4 TCP socket listening to a given port passed in through address
-    int create_socket(sockaddr_in address, int addr_len) const {
+    int create_socket(sockaddr_in& address, int addr_len) const {
         //  create socket
         // ipv4 protocol (af_inet), via tcp (sock_stream)
         int socket_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -234,7 +238,7 @@ class BaseServer {
         return &connections;
     }
 
-    void run(ConnectionManager* destination_clients=nullptr){
+    void run(){
         // creates a listening socket
 
         // create address object
@@ -275,7 +279,7 @@ class BaseServer {
             
             // accept this connection
             connections.add(conn_fd);
-            std::thread t([this,conn_fd, destination_clients]() {
+            std::thread t([this,conn_fd]() {
                 // use corresponding handler
                     this->handleClient(conn_fd);
                 // cleanup socket from connection list
@@ -290,8 +294,8 @@ class BaseServer {
 
 /**
  * @class DestinationServer
- * @brief Takes in any number of connections, waits for TCMP to
- * be sent from another server
+ * @brief Implementation of the destination server, takes in any number of connections,
+ * waits for CTMP to be sent from another server
  */
 class DestinationServer: public BaseServer {
     public:
@@ -319,8 +323,8 @@ class DestinationServer: public BaseServer {
 
 /**
  * @class SourceServer
- * @brief Takes in at most one client at a time (enforced via constructor),
- * broadcasts validated CTMP messages to a list of connected
+ * @brief Implementation of the source server, takes in at most one client at a time
+ * (enforced via constructor), broadcasts validated CTMP messages to a list of connected
  * destination clients (passed in through the constructor)
  */
 class SourceServer: public BaseServer {
@@ -364,8 +368,10 @@ class SourceServer: public BaseServer {
                 if (!CTMPMessageValidator::validate(message)) {
                     // Invalid message, drop these bytes
                     message.erase(message.begin(), message.begin() + full_msg_len);
+                    printf("Dropping message\n");
                     break;
                 }
+                printf("Broadcasting message\n");
 
                 // send the valid ctmp message to all destination clients
                 for (int conn : destination_clients->get_all()) {
@@ -387,7 +393,7 @@ int main() {
     DestinationServer destination_server;
 
     // create source server (only 1 connection allowed, forwards to destinations)
-    // pass in destination server connections to source server, used for sending messages
+    // pass in a pointer to destination server connections to source server, used for sending messages
     // to all clients of destination server
     SourceServer source_server(destination_server.get_connections());
 
