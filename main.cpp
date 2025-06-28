@@ -81,7 +81,6 @@ class CTMPMessageValidator {
         int options = get_options(data);
         if (nth_bit_set(options,1) && !validate_checksum(data, get_checksum(data))) {
             // invalid checksum on secure message
-            printf("Invalid checksum on secure message\n");
             return false;
         }
         size_t payload_length = get_payload_length(data);
@@ -368,10 +367,8 @@ class SourceServer: public BaseServer {
                 if (!CTMPMessageValidator::validate(message)) {
                     // Invalid message, drop these bytes
                     message.erase(message.begin(), message.begin() + full_msg_len);
-                    printf("Dropping message\n");
                     break;
                 }
-                printf("Broadcasting message\n");
 
                 // send the valid ctmp message to all destination clients
                 for (int conn : destination_clients->get_all()) {
