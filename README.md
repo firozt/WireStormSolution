@@ -96,5 +96,5 @@ contains the original solution for the base challenge
 ```
 git clone https://github.com/firozt/WireStormSolution.git
 cd WireStormSolution
-g++ -std=c++11 main.cpp -o main -pthread && ./main
+g++ -std=c++17 main.cpp -o main -pthread && ./main
 ```
