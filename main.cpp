@@ -5,6 +5,8 @@
 #include <thread>
 #include <set>
 #include <mutex>
+#include <strings.h>
+
 
 // global constants
 #define SOURCE_PORT 33333
