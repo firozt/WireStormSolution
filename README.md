@@ -21,6 +21,65 @@ On the call of the run method on a server, a new thread is created for each conn
 
 
 ---
+### UML Diagram
+```
+                 +----------------------+
+                 |      BaseServer      |   (abstract)
+                 +----------------------+
+                 | - port: uint16_t     |
+                 | - connections:       |
+                 |   ConnectionManager  |
+                 +----------------------+
+                 | + run(): void        |
+                 | + get_connections(): |
+                 |   ConnectionManager* |
+                 +----------------------+
+                 | - create_socket(...) |
+                 | - handleClient(int): |
+                 |   virtual            |
+                 +----------------------+
+                          ▲
+        +-----------------+------------------+
+        |                                    |
++--------------------------+     +--------------------------+
+|    DestinationServer     |     |       SourceServer       |
++--------------------------+     +--------------------------+
+| + DestinationServer()    |     | + SourceServer(dest*)    |
++--------------------------+     +--------------------------+
+| - handleClient(int):void |     | - handleClient(int):void |
+|                          |     | - destination_clients:   |
+|                          |     |   ConnectionManager*     |
+|                          |     | - send_message_all(...)  |
++--------------------------+     +--------------------------+
+
++--------------------------------------+
+|            ConnectionManager         |
++--------------------------------------+
+| - max_connections: int               |
+| - clients: std::set<int>             |
+| - mutex: std::mutex                  |
++--------------------------------------+
+| + add(fd: int): bool                 |
+| + remove(fd: int): void              |
+| + get_all(): std::set<int>           |
+| + size(): size_t                     |
+| + get_max_connections(): int         |
++--------------------------------------+
+
++----------------------------------------------------+
+|                CTMPMessageValidator (static)       |
++----------------------------------------------------+
+| + validate(data: vector<uint8_t>): bool            |
+| + validate_checksum(message, checksum): bool       |
+| + get_checksum(data): int                          |
+| + get_payload_length(data): int                    |
+| + get_options(data): int                           |
++----------------------------------------------------+
+| - nth_bit_set(byte: uint8_t, n: int): bool         |
++----------------------------------------------------+
+
+```
+---
 
 ### Github Branch Structure
 #### main
