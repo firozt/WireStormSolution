@@ -98,3 +98,4 @@ git clone https://github.com/firozt/WireStormSolution.git
 cd WireStormSolution
 g++ -std=c++17 main.cpp -o main -pthread && ./main
 ```
+after running the g++ command the program should indicate that it's listening on port 44444 and 33333
